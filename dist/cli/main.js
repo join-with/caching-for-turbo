@@ -100435,7 +100435,7 @@ var require_dist_cjs16 = __commonJS({
         Object.setPrototypeOf(this, _NoSuchBucket.prototype);
       }
     };
-    var NoSuchKey = class _NoSuchKey extends S3ServiceException {
+    var NoSuchKey2 = class _NoSuchKey extends S3ServiceException {
       static shapeId = "com.amazonaws.s3#NoSuchKey";
       name = "NoSuchKey";
       $fault = "client";
@@ -101852,7 +101852,7 @@ var require_dist_cjs16 = __commonJS({
       [],
       []
     ];
-    n0_registry5.registerError(NoSuchKey$, NoSuchKey);
+    n0_registry5.registerError(NoSuchKey$, NoSuchKey2);
     var NoSuchUpload$ = [
       -3,
       n05,
@@ -107591,7 +107591,7 @@ var require_dist_cjs16 = __commonJS({
     exports2.NoSuchAnnotation$ = NoSuchAnnotation$;
     exports2.NoSuchBucket = NoSuchBucket;
     exports2.NoSuchBucket$ = NoSuchBucket$;
-    exports2.NoSuchKey = NoSuchKey;
+    exports2.NoSuchKey = NoSuchKey2;
     exports2.NoSuchKey$ = NoSuchKey$;
     exports2.NoSuchUpload = NoSuchUpload;
     exports2.NoSuchUpload$ = NoSuchUpload$;
@@ -191052,6 +191052,7 @@ var getInput3 = (name, envNames) => {
   }
   return void 0;
 };
+var artifactTagMetadata = "artifact-tag";
 var getS3Provider = (tracker) => {
   const s3AccessKeyId = getInput3("s3-access-key-id", [
     "AWS_ACCESS_KEY_ID",
@@ -191091,15 +191092,15 @@ var getS3Provider = (tracker) => {
       sessionToken: s3SessionToken
     }
   });
-  const getS3Key = (hash, tag) => {
-    const key = getCacheKey(hash, tag);
+  const getS3Key = (hash) => {
+    const key = getCacheKey(hash);
     if (s3Prefix) {
       return `${s3Prefix}${key}`;
     }
     return key;
   };
   const save = async (ctx, hash, tag, stream2) => {
-    const objectKey = getS3Key(hash, tag);
+    const objectKey = getS3Key(hash);
     try {
       const upload = new import_lib_storage.Upload({
         client: s3Client,
@@ -191107,7 +191108,8 @@ var getS3Provider = (tracker) => {
           Bucket: s3Bucket,
           Key: objectKey,
           Body: stream2,
-          ContentType: "application/octet-stream"
+          ContentType: "application/octet-stream",
+          Metadata: tag ? { [artifactTagMetadata]: tag } : void 0
         }
       });
       await upload.done();
@@ -191120,48 +191122,27 @@ var getS3Provider = (tracker) => {
   const get2 = async (ctx, hash) => {
     const objectKey = getS3Key(hash);
     try {
-      const listCommand = new import_client_s3.ListObjectsV2Command({
-        Bucket: s3Bucket,
-        Prefix: objectKey,
-        MaxKeys: 10
-      });
-      const listResponse = await s3Client.send(listCommand);
-      if (!listResponse.Contents || listResponse.Contents.length === 0) {
-        ctx.log.info(`No cached artifact found for ${hash}`);
-        return null;
-      }
-      const matchingObjects = listResponse.Contents.filter(
-        (obj) => obj.Key && obj.Key.startsWith(objectKey)
+      const response = await s3Client.send(
+        new import_client_s3.GetObjectCommand({
+          Bucket: s3Bucket,
+          Key: objectKey
+        })
       );
-      if (matchingObjects.length === 0) {
-        return null;
-      }
-      matchingObjects.sort((a5, b5) => {
-        const dateA = a5.LastModified?.getTime() || 0;
-        const dateB = b5.LastModified?.getTime() || 0;
-        return dateB - dateA;
-      });
-      const latestObject = matchingObjects[0];
-      const key = latestObject.Key;
-      const getCommand = new import_client_s3.GetObjectCommand({
-        Bucket: s3Bucket,
-        Key: key
-      });
-      const response = await s3Client.send(getCommand);
       if (!response.Body) {
         ctx.log.info(`Failed to get artifact body from S3`);
         return null;
       }
-      const size = response.ContentLength;
-      const stream2 = response.Body;
-      let artifactTag;
-      if (key.includes("#")) {
-        const parts = key.split("#");
-        artifactTag = parts[parts.length - 1];
-      }
-      ctx.log.info(`Retrieved artifact from S3: ${key}`);
-      return [size, stream2, artifactTag];
+      ctx.log.info(`Retrieved artifact from S3: ${objectKey}`);
+      return [
+        response.ContentLength,
+        response.Body,
+        response.Metadata?.[artifactTagMetadata]
+      ];
     } catch (error4) {
+      if (error4 instanceof import_client_s3.NoSuchKey) {
+        ctx.log.info(`No cached artifact found for ${hash}`);
+        return null;
+      }
       ctx.log.info(`Error getting artifact from S3: ${error4}`);
       return null;
     }

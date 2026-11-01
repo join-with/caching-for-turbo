@@ -7,7 +7,8 @@ import {
   S3Client,
   GetObjectCommand,
   DeleteObjectCommand,
-  ListObjectsV2Command
+  ListObjectsV2Command,
+  NoSuchKey
 } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 import { getCacheKey } from '@/lib/constants'
@@ -32,6 +33,8 @@ const getInput = (name: string, envNames?: string[]): string | undefined => {
   }
   return undefined
 }
+
+const artifactTagMetadata = 'artifact-tag'
 
 export const getS3Provider = (
   tracker: ReturnType<typeof getTracker>
@@ -78,8 +81,11 @@ export const getS3Provider = (
     }
   })
 
-  const getS3Key = (hash: string, tag?: string) => {
-    const key = getCacheKey(hash, tag)
+  // The artifact tag lives in object metadata, not the key, so a lookup can read
+  // the object directly from the hash. A list before each read bills as a write
+  // on R2 ($4.50 per million against $0.36).
+  const getS3Key = (hash: string) => {
+    const key = getCacheKey(hash)
     if (s3Prefix) {
       return `${s3Prefix}${key}`
     }
@@ -92,7 +98,7 @@ export const getS3Provider = (
     tag: string,
     stream: Readable
   ): Promise<void> => {
-    const objectKey = getS3Key(hash, tag)
+    const objectKey = getS3Key(hash)
     try {
       // Use the S3 Upload utility which handles multipart uploads for large files
       const upload = new Upload({
@@ -101,7 +107,8 @@ export const getS3Provider = (
           Bucket: s3Bucket,
           Key: objectKey,
           Body: stream,
-          ContentType: 'application/octet-stream'
+          ContentType: 'application/octet-stream',
+          Metadata: tag ? { [artifactTagMetadata]: tag } : undefined
         }
       })
 
@@ -119,69 +126,32 @@ export const getS3Provider = (
   ): Promise<
     [number | undefined, Readable | ReadableStream, string | undefined] | null
   > => {
-    // First try to get with just the hash
     const objectKey = getS3Key(hash)
 
     try {
-      // Try to find the object
-      const listCommand = new ListObjectsV2Command({
-        Bucket: s3Bucket,
-        Prefix: objectKey,
-        MaxKeys: 10
-      })
-
-      const listResponse = await s3Client.send(listCommand)
-
-      if (!listResponse.Contents || listResponse.Contents.length === 0) {
-        ctx.log.info(`No cached artifact found for ${hash}`)
-        return null
-      }
-
-      // Find the most recent object that matches the hash prefix
-      const matchingObjects = listResponse.Contents.filter(
-        obj => obj.Key && obj.Key.startsWith(objectKey)
+      const response = await s3Client.send(
+        new GetObjectCommand({
+          Bucket: s3Bucket,
+          Key: objectKey
+        })
       )
-
-      if (matchingObjects.length === 0) {
-        return null
-      }
-
-      // Sort by last modified date, newest first
-      matchingObjects.sort((a, b) => {
-        const dateA = a.LastModified?.getTime() || 0
-        const dateB = b.LastModified?.getTime() || 0
-        return dateB - dateA
-      })
-
-      const latestObject = matchingObjects[0]
-      const key = latestObject.Key as string
-
-      // Get the object
-      const getCommand = new GetObjectCommand({
-        Bucket: s3Bucket,
-        Key: key
-      })
-
-      const response = await s3Client.send(getCommand)
 
       if (!response.Body) {
         ctx.log.info(`Failed to get artifact body from S3`)
         return null
       }
 
-      const size = response.ContentLength
-      const stream = response.Body as Readable
-
-      // Extract the tag if it exists
-      let artifactTag: string | undefined
-      if (key.includes('#')) {
-        const parts = key.split('#')
-        artifactTag = parts[parts.length - 1]
-      }
-
-      ctx.log.info(`Retrieved artifact from S3: ${key}`)
-      return [size, stream, artifactTag]
+      ctx.log.info(`Retrieved artifact from S3: ${objectKey}`)
+      return [
+        response.ContentLength,
+        response.Body as Readable,
+        response.Metadata?.[artifactTagMetadata]
+      ]
     } catch (error) {
+      if (error instanceof NoSuchKey) {
+        ctx.log.info(`No cached artifact found for ${hash}`)
+        return null
+      }
       ctx.log.info(`Error getting artifact from S3: ${error}`)
       return null
     }
