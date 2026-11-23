@@ -12,7 +12,8 @@ import {
   NoSuchKey
 } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
-import { getCacheKey } from '@/lib/constants'
+import { cachePrefix, getCacheKey } from '@/lib/constants'
+import { KeyIndex } from './index-cache'
 import { core } from '@/lib/core'
 import { mapLimit, timingProvider } from '@/lib/utils'
 import { getTracker } from '@/lib/tracker'
@@ -40,6 +41,13 @@ const artifactTagMetadata = 'artifact-tag'
 // Turbo asks about up to 100 hashes per batch and sends the batches one after
 // another; 32 checks in flight keep a batch to a few round trips.
 const existsConcurrency = 32
+
+// One key index per bucket and prefix, kept for the life of the process:
+// getS3Provider runs on every request.
+const keyIndexes = new Map<string, KeyIndex>()
+
+/** Drops every key index; for tests. */
+export const resetS3KeyIndexes = (): void => keyIndexes.clear()
 
 /** HeadObject reports a missing key as a bare 404 (`NotFound`), not NoSuchKey. */
 const isNotFound = (error: unknown): boolean => {
@@ -104,6 +112,37 @@ export const getS3Provider = (
     return key
   }
 
+  const keyPrefix = `${s3Prefix}${cachePrefix}`
+  const indexId = `${s3Endpoint}|${s3Bucket}|${keyPrefix}`
+  let keyIndex = keyIndexes.get(indexId)
+  if (!keyIndex) {
+    const listPage = timingProvider(
+      'list',
+      tracker,
+      async (prefix: string, continuationToken?: string) => {
+        const response = await s3Client.send(
+          new ListObjectsV2Command({
+            Bucket: s3Bucket,
+            Prefix: prefix,
+            MaxKeys: 1000,
+            ContinuationToken: continuationToken
+          })
+        )
+        return {
+          keys: (response.Contents ?? []).flatMap(o => (o.Key ? [o.Key] : [])),
+          next: response.NextContinuationToken
+        }
+      }
+    )
+    keyIndex = new KeyIndex({
+      listPage,
+      keyPrefix,
+      log: message => console.log(message)
+    })
+    keyIndexes.set(indexId, keyIndex)
+  }
+  const index = keyIndex
+
   const save = async (
     ctx: RequestContext,
     hash: string,
@@ -125,6 +164,7 @@ export const getS3Provider = (
       })
 
       await upload.done()
+      index.add(hash)
       ctx.log.info(`Saved artifact to S3: ${objectKey}`)
     } catch (error) {
       ctx.log.info(`Error saving artifact to S3: ${error}`)
@@ -189,10 +229,20 @@ export const getS3Provider = (
     ctx: RequestContext,
     hashes: readonly string[]
   ): Promise<Map<string, boolean>> => {
-    const found = await mapLimit(hashes, existsConcurrency, hash =>
+    // The index answers what it covers when it is ready in time; R2 answers
+    // the rest, one HeadObject per hash
+    const ready = await index.whenReady()
+    const answers = new Map<string, boolean>()
+    const unanswered: string[] = []
+    for (const hash of hashes) {
+      if (ready && index.covers(hash)) answers.set(hash, ready.has(hash))
+      else unanswered.push(hash)
+    }
+    const found = await mapLimit(unanswered, existsConcurrency, hash =>
       timedExists(ctx, hash)
     )
-    return new Map(hashes.map((hash, i) => [hash, found[i]]))
+    unanswered.forEach((hash, i) => answers.set(hash, found[i]))
+    return answers
   }
 
   const deleteObj = async (key: string): Promise<void> => {
