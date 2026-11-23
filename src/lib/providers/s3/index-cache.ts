@@ -13,8 +13,6 @@ export type KeyIndexOptions = {
   keyPrefix: string
   /** Prefix listings in flight at once. */
   concurrency?: number
-  /** How long after a build starts callers wait for it. */
-  readyTimeoutMs?: number
   log?: (message: string) => void
 }
 
@@ -32,9 +30,10 @@ const shardable = /^[0-9a-f]{2}/
  * The set of hashes in the bucket, listed once per process the first time
  * it is asked for and kept current by add() after each save.
  *
- * A failed build resets it, so the next caller starts a new one. Callers
- * wait for a build at most readyTimeoutMs from its start; after that they
- * get undefined and check R2 per hash while the build carries on.
+ * Nothing waits for a build: current() starts one and answers undefined
+ * until it is done, and callers check R2 per hash meanwhile, so a small
+ * batch never pays the listing (join-with/joinwith#18540). A failed build
+ * resets it, so the next caller starts a new one.
  *
  * The index only answers for hashes that start with two lowercase hex
  * digits, the ones the shard listing covers (covers()).
@@ -43,14 +42,12 @@ export class KeyIndex {
   private readonly listPage: ListPage
   private readonly keyPrefix: string
   private readonly concurrency: number
-  private readonly readyTimeoutMs: number
   private readonly log: (message: string) => void
 
   /** The hashes of the current build, filled while it lists. */
   private keys: Set<string> | undefined
   private build: Promise<Set<string>> | undefined
   private ready: Set<string> | undefined
-  private deadline = 0
 
   stats: KeyIndexStats | undefined
 
@@ -58,7 +55,6 @@ export class KeyIndex {
     this.listPage = options.listPage
     this.keyPrefix = options.keyPrefix
     this.concurrency = options.concurrency ?? 32
-    this.readyTimeoutMs = options.readyTimeoutMs ?? 15_000
     this.log = options.log ?? (() => {})
   }
 
@@ -68,25 +64,28 @@ export class KeyIndex {
   }
 
   /**
-   * The index once built, or undefined when the build failed or is not done
-   * by its deadline. Starts a build when none is running.
+   * The index once built, otherwise undefined. Starts a build when none is
+   * running and never waits for it.
    */
-  async whenReady(): Promise<ReadonlySet<string> | undefined> {
+  current(): ReadonlySet<string> | undefined {
     if (this.ready) return this.ready
     if (!this.build) this.start()
-    const build = this.build as Promise<Set<string>>
-    const remaining = this.deadline - Date.now()
-    if (remaining <= 0) return undefined
+    return undefined
+  }
 
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const timeout = new Promise<undefined>(resolve => {
-      timer = setTimeout(() => resolve(undefined), remaining)
-    })
-    try {
-      return await Promise.race([build.catch(() => undefined), timeout])
-    } finally {
-      clearTimeout(timer)
-    }
+  /**
+   * Waits for the running build, starting one when none is running: the
+   * index, or undefined when the build fails.
+   */
+  async whenReady(): Promise<ReadonlySet<string> | undefined> {
+    this.current()
+    await this.settled()
+    return this.ready
+  }
+
+  /** Waits for the running build, if any, to finish or fail. */
+  async settled(): Promise<void> {
+    await this.build?.catch(() => {})
   }
 
   /** Records a saved hash; a no-op before the first build starts. */
@@ -97,7 +96,6 @@ export class KeyIndex {
   private start(): void {
     const keys = new Set<string>()
     this.keys = keys
-    this.deadline = Date.now() + this.readyTimeoutMs
     const build = this.list(keys).then(
       stats => {
         this.stats = stats
@@ -117,7 +115,7 @@ export class KeyIndex {
         throw error
       }
     )
-    // whenReady() handles the rejection; don't let it go unhandled meanwhile
+    // Logged and reset above; callers never see the rejection
     build.catch(() => {})
     this.build = build
   }

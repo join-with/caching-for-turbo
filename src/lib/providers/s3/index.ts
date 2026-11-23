@@ -49,6 +49,11 @@ const keyIndexes = new Map<string, KeyIndex>()
 /** Drops every key index; for tests. */
 export const resetS3KeyIndexes = (): void => keyIndexes.clear()
 
+/** Waits for every running key index build to finish or fail; for tests. */
+export const settleS3KeyIndexes = async (): Promise<void> => {
+  await Promise.all([...keyIndexes.values()].map(index => index.settled()))
+}
+
 /** HeadObject reports a missing key as a bare 404 (`NotFound`), not NoSuchKey. */
 const isNotFound = (error: unknown): boolean => {
   if (error instanceof NoSuchKey) return true
@@ -229,9 +234,10 @@ export const getS3Provider = (
     ctx: RequestContext,
     hashes: readonly string[]
   ): Promise<Map<string, boolean>> => {
-    // The index answers what it covers when it is ready in time; R2 answers
-    // the rest, one HeadObject per hash
-    const ready = await index.whenReady()
+    // The index answers what it covers once built; until then, and for the
+    // hashes it doesn't cover, R2 answers one HeadObject per hash. The first
+    // batch starts the build without waiting for it (#18540).
+    const ready = index.current()
     const answers = new Map<string, boolean>()
     const unanswered: string[] = []
     for (const hash of hashes) {
