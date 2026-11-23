@@ -20,7 +20,13 @@ vi.mock('@aws-sdk/lib-storage', () => ({
   })
 }))
 
-import { GetObjectCommand, NoSuchKey } from '@aws-sdk/client-s3'
+import {
+  GetObjectCommand,
+  HeadObjectCommand,
+  NoSuchKey,
+  NotFound,
+  S3ServiceException
+} from '@aws-sdk/client-s3'
 import { getS3Provider } from '../../../../src/lib/providers/s3'
 import { getTracker } from '../../../../src/lib/tracker'
 
@@ -81,5 +87,35 @@ describe('s3 provider', () => {
     expect(await getS3Provider(getTracker()).get(ctx, 'abc')).toBeNull()
     expect(send).toHaveBeenCalledTimes(1)
     expect(send.mock.calls[0][0]).toBeInstanceOf(GetObjectCommand)
+  })
+
+  it('checks existence with one HeadObject', async () => {
+    send.mockResolvedValueOnce({})
+
+    expect(await getS3Provider(getTracker()).exists(ctx, 'abc')).toBe(true)
+    expect(send).toHaveBeenCalledTimes(1)
+    const command = send.mock.calls[0][0]
+    expect(command).toBeInstanceOf(HeadObjectCommand)
+    expect(command.input.Key).toBe('prefix/turbogha_abc')
+  })
+
+  it('treats a 404 from HeadObject as a miss', async () => {
+    send.mockRejectedValueOnce(new NotFound({ message: '', $metadata: {} }))
+
+    expect(await getS3Provider(getTracker()).exists(ctx, 'abc')).toBe(false)
+  })
+
+  it('throws any other HeadObject error', async () => {
+    const error = new S3ServiceException({
+      name: 'AccessDenied',
+      $fault: 'client',
+      message: 'denied',
+      $metadata: { httpStatusCode: 403 }
+    })
+    send.mockRejectedValueOnce(error)
+
+    await expect(getS3Provider(getTracker()).exists(ctx, 'abc')).rejects.toBe(
+      error
+    )
   })
 })

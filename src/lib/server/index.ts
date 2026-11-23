@@ -1,8 +1,8 @@
-import Fastify from 'fastify'
+import Fastify, { type FastifyInstance } from 'fastify'
 import { writeFileSync } from 'fs'
 import { serverPort, serverPortFile } from '../constants'
 import { cleanup } from './cleanup'
-import { getProvider } from '../providers'
+import { ExistsNotSupportedError, getProvider } from '../providers'
 import { Readable } from 'stream'
 import { getTracker } from '../tracker'
 
@@ -12,9 +12,18 @@ export type RequestContext = {
   }
 }
 
-export async function server(): Promise<void> {
-  const tracker = getTracker()
+/** Reads turbo's batch body, `{"hashes": [...]}`; undefined when malformed. */
+const parseHashes = (body: unknown): string[] | undefined => {
+  const hashes = (body as { hashes?: unknown } | null)?.hashes
+  if (!Array.isArray(hashes)) return undefined
+  if (!hashes.every(h => typeof h === 'string' && h.length > 0))
+    return undefined
+  return hashes
+}
 
+export function buildServer(
+  tracker: ReturnType<typeof getTracker> = getTracker()
+): FastifyInstance {
   //* Create the server
   const fastify = Fastify({
     logger: process.env.LOG_LEVEL === 'debug' ? true : false
@@ -90,10 +99,16 @@ export async function server(): Promise<void> {
     await cleanup(ctx, tracker)
 
     //* Print tracker
-    const total = tracker.save + tracker.get + tracker.delete + tracker.list
+    const total =
+      tracker.save +
+      tracker.get +
+      tracker.exists +
+      tracker.delete +
+      tracker.list
     console.log('Average time taken:', {
       save: `${tracker.save}ms (${Math.round((tracker.save / Math.max(total, 1)) * 100)}%)`,
       get: `${tracker.get}ms (${Math.round((tracker.get / Math.max(total, 1)) * 100)}%)`,
+      exists: `${tracker.exists}ms (${Math.round((tracker.exists / Math.max(total, 1)) * 100)}%)`,
       delete: `${tracker.delete}ms (${Math.round((tracker.delete / Math.max(total, 1)) * 100)}%)`,
       list: `${tracker.list}ms (${Math.round((tracker.list / Math.max(total, 1)) * 100)}%)`
     })
@@ -130,28 +145,89 @@ export async function server(): Promise<void> {
     return { ok: true }
   })
 
-  //? Download cache
-  fastify.get('/v8/artifacts/:hash', async (request, reply) => {
-    const hash = (request.params as { hash: string }).hash
-    request.log.info(`Requested artifact for ${hash}`)
-    const provider = getProvider(tracker)
-    const result = await provider.get(request, hash)
-    if (result === null) {
-      request.log.info(`Artifact for ${hash} not found`)
-      reply.code(404)
-      return { ok: false }
+  //? Batch existence check (turbo's dry runs)
+  // Turbo sends up to 100 hashes and expects every one back: `{taskDurationMs}`
+  // for a hit, null for a miss. Any non-2xx makes it fall back to one HEAD per
+  // hash, so a failure answers 501 rather than reporting the batch as misses.
+  fastify.post('/v8/artifacts', async (request, reply) => {
+    const hashes = parseHashes(request.body)
+    if (!hashes) {
+      reply.code(400)
+      return { ok: false, error: 'Expected a JSON body {"hashes": string[]}' }
     }
-    const [size, stream, artifactTag] = result
-    if (size) {
-      reply.header('Content-Length', size)
+    try {
+      const provider = getProvider(tracker)
+      const found = await provider.existsMany(request, hashes)
+      const answer: Record<string, { taskDurationMs: number } | null> = {}
+      for (const hash of hashes) {
+        const hit = found.get(hash)
+        if (hit === undefined) throw new Error(`No answer for ${hash}`)
+        // The relay keeps no duration, the same 0 turbo reads from a GET
+        answer[hash] = hit ? { taskDurationMs: 0 } : null
+      }
+      return answer
+    } catch (error) {
+      request.log.error(`Batch existence check failed: ${error}`)
+      reply.code(501)
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      }
     }
-    reply.header('Content-Type', 'application/octet-stream')
-    if (artifactTag) {
-      reply.header('x-artifact-tag', artifactTag)
-    }
-    request.log.info(`Sending artifact for ${hash}`)
-    return reply.send(stream)
   })
+
+  //? Existence check of one artifact, without reading its body
+  fastify.head('/v8/artifacts/:hash', async (request, reply) => {
+    const hash = (request.params as { hash: string }).hash
+    const provider = getProvider(tracker)
+    let found: boolean
+    try {
+      found = await provider.exists(request, hash)
+    } catch (error) {
+      if (error instanceof ExistsNotSupportedError) {
+        // Before this route, HEAD ran the GET handler; keep that for providers
+        // without a cheap check
+        const result = await provider.get(request, hash)
+        if (result && result[1] instanceof Readable) result[1].destroy()
+        found = result !== null
+      } else {
+        // GET answers a read error as a miss; HEAD stays consistent with it
+        request.log.error(`Existence check for ${hash} failed: ${error}`)
+        found = false
+      }
+    }
+    reply.code(found ? 200 : 404)
+    return reply.send()
+  })
+
+  //? Download cache
+  // exposeHeadRoute: false, so fastify's automatic HEAD (which would run this
+  // handler and open the whole object) doesn't shadow the HEAD route above
+  fastify.get(
+    '/v8/artifacts/:hash',
+    { exposeHeadRoute: false },
+    async (request, reply) => {
+      const hash = (request.params as { hash: string }).hash
+      request.log.info(`Requested artifact for ${hash}`)
+      const provider = getProvider(tracker)
+      const result = await provider.get(request, hash)
+      if (result === null) {
+        request.log.info(`Artifact for ${hash} not found`)
+        reply.code(404)
+        return { ok: false }
+      }
+      const [size, stream, artifactTag] = result
+      if (size) {
+        reply.header('Content-Length', size)
+      }
+      reply.header('Content-Type', 'application/octet-stream')
+      if (artifactTag) {
+        reply.header('x-artifact-tag', artifactTag)
+      }
+      request.log.info(`Sending artifact for ${hash}`)
+      return reply.send(stream)
+    }
+  )
 
   /**
    *  Login and link commands
@@ -209,6 +285,12 @@ export async function server(): Promise<void> {
       ]
     }
   })
+
+  return fastify
+}
+
+export async function server(): Promise<void> {
+  const fastify = buildServer()
 
   //* Start the server
   await fastify.listen({ port: serverPort })

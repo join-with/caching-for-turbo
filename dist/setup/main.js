@@ -105996,7 +105996,7 @@ var require_dist_cjs16 = __commonJS({
     };
     var HeadBucketCommand = class extends command5(_ep5, _mw05, "HeadBucket", HeadBucket$) {
     };
-    var HeadObjectCommand = class extends command5(_ep05, _mw8, "HeadObject", HeadObject$) {
+    var HeadObjectCommand2 = class extends command5(_ep05, _mw8, "HeadObject", HeadObject$) {
     };
     var ListBucketAnalyticsConfigurationsCommand = class extends command5(_ep3, _mw05, "ListBucketAnalyticsConfigurations", ListBucketAnalyticsConfigurations$) {
     };
@@ -106149,7 +106149,7 @@ var require_dist_cjs16 = __commonJS({
     var checkState$1 = async (client, input) => {
       let reason;
       try {
-        let result = await client.send(new HeadObjectCommand(input));
+        let result = await client.send(new HeadObjectCommand2(input));
         reason = result;
         return { state: WaiterState2.SUCCESS, reason };
       } catch (exception) {
@@ -106172,7 +106172,7 @@ var require_dist_cjs16 = __commonJS({
     var checkState = async (client, input) => {
       let reason;
       try {
-        let result = await client.send(new HeadObjectCommand(input));
+        let result = await client.send(new HeadObjectCommand2(input));
         reason = result;
       } catch (exception) {
         reason = exception;
@@ -106254,7 +106254,7 @@ var require_dist_cjs16 = __commonJS({
       GetObjectTorrentCommand,
       GetPublicAccessBlockCommand,
       HeadBucketCommand,
-      HeadObjectCommand,
+      HeadObjectCommand: HeadObjectCommand2,
       ListBucketAnalyticsConfigurationsCommand,
       ListBucketIntelligentTieringConfigurationsCommand,
       ListBucketInventoryConfigurationsCommand,
@@ -107081,7 +107081,7 @@ var require_dist_cjs16 = __commonJS({
     exports2.HeadBucketOutput$ = HeadBucketOutput$;
     exports2.HeadBucketRequest$ = HeadBucketRequest$;
     exports2.HeadObject$ = HeadObject$;
-    exports2.HeadObjectCommand = HeadObjectCommand;
+    exports2.HeadObjectCommand = HeadObjectCommand2;
     exports2.HeadObjectOutput$ = HeadObjectOutput$;
     exports2.HeadObjectRequest$ = HeadObjectRequest$;
     exports2.IdempotencyParameterMismatch = IdempotencyParameterMismatch;
@@ -153400,6 +153400,34 @@ var timingProvider = (name, tracker, fn) => {
     return result;
   };
 };
+var mapLimit = async (items, limit, fn) => {
+  const results = new Array(items.length);
+  let next = 0;
+  let failed = false;
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const i5 = next++;
+      try {
+        results[i5] = await fn(items[i5]);
+      } catch (error4) {
+        failed = true;
+        throw error4;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker)
+  );
+  return results;
+};
+
+// src/lib/providers/errors.ts
+var ExistsNotSupportedError = class extends Error {
+  constructor(provider) {
+    super(`The ${provider} provider can't check existence without a download`);
+    this.name = "ExistsNotSupportedError";
+  }
+};
 
 // src/lib/providers/cache/utils.ts
 var import_stream_to_promise = __toESM(require_stream_to_promise(), 1);
@@ -190625,6 +190653,15 @@ async function getCache(ctx, hash) {
   const readableStream = createReadStream2(fileRestorationPath);
   return [size, readableStream, artifactTag];
 }
+async function existsCache(_ctx, hash) {
+  if (!env2.valid) return existsSync4(getFsCachePath(hash));
+  throw new ExistsNotSupportedError("github");
+}
+async function existsManyCache(ctx, hashes) {
+  const found = /* @__PURE__ */ new Map();
+  for (const hash of hashes) found.set(hash, await existsCache(ctx, hash));
+  return found;
+}
 async function deleteCache() {
   throw new Error(`Cannot delete github cache automatically.`);
 }
@@ -190636,6 +190673,8 @@ var getGithubProvider = (tracker) => {
     name: "github",
     save: timingProvider("save", tracker, saveCache3),
     get: timingProvider("get", tracker, getCache),
+    exists: timingProvider("exists", tracker, existsCache),
+    existsMany: existsManyCache,
     delete: timingProvider("delete", tracker, deleteCache),
     list: timingProvider("list", tracker, listCache)
   };
@@ -190658,6 +190697,12 @@ var getInput3 = (name, envNames) => {
   return void 0;
 };
 var artifactTagMetadata = "artifact-tag";
+var existsConcurrency = 32;
+var isNotFound = (error4) => {
+  if (error4 instanceof import_client_s3.NoSuchKey) return true;
+  const e5 = error4;
+  return e5?.name === "NotFound" || e5?.$metadata?.httpStatusCode === 404;
+};
 var getS3Provider = (tracker) => {
   const s3AccessKeyId = getInput3("s3-access-key-id", [
     "AWS_ACCESS_KEY_ID",
@@ -190752,6 +190797,26 @@ var getS3Provider = (tracker) => {
       return null;
     }
   };
+  const exists2 = async (_ctx, hash) => {
+    try {
+      await s3Client.send(
+        new import_client_s3.HeadObjectCommand({ Bucket: s3Bucket, Key: getS3Key(hash) })
+      );
+      return true;
+    } catch (error4) {
+      if (isNotFound(error4)) return false;
+      throw error4;
+    }
+  };
+  const timedExists = timingProvider("exists", tracker, exists2);
+  const existsMany = async (ctx, hashes) => {
+    const found = await mapLimit(
+      hashes,
+      existsConcurrency,
+      (hash) => timedExists(ctx, hash)
+    );
+    return new Map(hashes.map((hash, i5) => [hash, found[i5]]));
+  };
   const deleteObj = async (key) => {
     try {
       const deleteCommand = new import_client_s3.DeleteObjectCommand({
@@ -190808,6 +190873,8 @@ var getS3Provider = (tracker) => {
     name: "s3",
     save: timingProvider("save", tracker, save),
     get: timingProvider("get", tracker, get2),
+    exists: timedExists,
+    existsMany,
     delete: timingProvider("delete", tracker, deleteObj),
     list: timingProvider("list", tracker, list2)
   };
@@ -191043,13 +191110,20 @@ import { Readable as Readable12 } from "stream";
 var getTracker = () => ({
   save: 0,
   get: 0,
+  exists: 0,
   delete: 0,
   list: 0
 });
 
 // src/lib/server/index.ts
-async function server() {
-  const tracker = getTracker();
+var parseHashes = (body2) => {
+  const hashes = body2?.hashes;
+  if (!Array.isArray(hashes)) return void 0;
+  if (!hashes.every((h6) => typeof h6 === "string" && h6.length > 0))
+    return void 0;
+  return hashes;
+};
+function buildServer(tracker = getTracker()) {
   const fastify = (0, import_fastify.default)({
     logger: process.env.LOG_LEVEL === "debug" ? true : false
   });
@@ -191104,10 +191178,11 @@ async function server() {
   });
   const shutdown = async (ctx) => {
     await cleanup(ctx, tracker);
-    const total = tracker.save + tracker.get + tracker.delete + tracker.list;
+    const total = tracker.save + tracker.get + tracker.exists + tracker.delete + tracker.list;
     console.log("Average time taken:", {
       save: `${tracker.save}ms (${Math.round(tracker.save / Math.max(total, 1) * 100)}%)`,
       get: `${tracker.get}ms (${Math.round(tracker.get / Math.max(total, 1) * 100)}%)`,
+      exists: `${tracker.exists}ms (${Math.round(tracker.exists / Math.max(total, 1) * 100)}%)`,
       delete: `${tracker.delete}ms (${Math.round(tracker.delete / Math.max(total, 1) * 100)}%)`,
       list: `${tracker.list}ms (${Math.round(tracker.list / Math.max(total, 1) * 100)}%)`
     });
@@ -191136,27 +191211,75 @@ async function server() {
     request.log.info(`Saved artifact for ${hash}`);
     return { ok: true };
   });
-  fastify.get("/v8/artifacts/:hash", async (request, reply) => {
-    const hash = request.params.hash;
-    request.log.info(`Requested artifact for ${hash}`);
-    const provider = getProvider(tracker);
-    const result = await provider.get(request, hash);
-    if (result === null) {
-      request.log.info(`Artifact for ${hash} not found`);
-      reply.code(404);
-      return { ok: false };
+  fastify.post("/v8/artifacts", async (request, reply) => {
+    const hashes = parseHashes(request.body);
+    if (!hashes) {
+      reply.code(400);
+      return { ok: false, error: 'Expected a JSON body {"hashes": string[]}' };
     }
-    const [size, stream2, artifactTag] = result;
-    if (size) {
-      reply.header("Content-Length", size);
+    try {
+      const provider = getProvider(tracker);
+      const found = await provider.existsMany(request, hashes);
+      const answer = {};
+      for (const hash of hashes) {
+        const hit = found.get(hash);
+        if (hit === void 0) throw new Error(`No answer for ${hash}`);
+        answer[hash] = hit ? { taskDurationMs: 0 } : null;
+      }
+      return answer;
+    } catch (error4) {
+      request.log.error(`Batch existence check failed: ${error4}`);
+      reply.code(501);
+      return {
+        ok: false,
+        error: error4 instanceof Error ? error4.message : String(error4)
+      };
     }
-    reply.header("Content-Type", "application/octet-stream");
-    if (artifactTag) {
-      reply.header("x-artifact-tag", artifactTag);
-    }
-    request.log.info(`Sending artifact for ${hash}`);
-    return reply.send(stream2);
   });
+  fastify.head("/v8/artifacts/:hash", async (request, reply) => {
+    const hash = request.params.hash;
+    const provider = getProvider(tracker);
+    let found;
+    try {
+      found = await provider.exists(request, hash);
+    } catch (error4) {
+      if (error4 instanceof ExistsNotSupportedError) {
+        const result = await provider.get(request, hash);
+        if (result && result[1] instanceof Readable12) result[1].destroy();
+        found = result !== null;
+      } else {
+        request.log.error(`Existence check for ${hash} failed: ${error4}`);
+        found = false;
+      }
+    }
+    reply.code(found ? 200 : 404);
+    return reply.send();
+  });
+  fastify.get(
+    "/v8/artifacts/:hash",
+    { exposeHeadRoute: false },
+    async (request, reply) => {
+      const hash = request.params.hash;
+      request.log.info(`Requested artifact for ${hash}`);
+      const provider = getProvider(tracker);
+      const result = await provider.get(request, hash);
+      if (result === null) {
+        request.log.info(`Artifact for ${hash} not found`);
+        reply.code(404);
+        return { ok: false };
+      }
+      const [size, stream2, artifactTag] = result;
+      if (size) {
+        reply.header("Content-Length", size);
+      }
+      reply.header("Content-Type", "application/octet-stream");
+      if (artifactTag) {
+        reply.header("x-artifact-tag", artifactTag);
+      }
+      request.log.info(`Sending artifact for ${hash}`);
+      return reply.send(stream2);
+    }
+  );
   fastify.get("/v5/user/tokens/current", async () => {
     return {
       ok: true,
@@ -191206,6 +191329,10 @@ async function server() {
       ]
     };
   });
+  return fastify;
+}
+async function server() {
+  const fastify = buildServer();
   await fastify.listen({ port: serverPort });
   const address = fastify.server.address();
   const actualPort = address && typeof address === "object" ? address.port : serverPort;

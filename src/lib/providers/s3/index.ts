@@ -6,6 +6,7 @@ import { TListFile } from '../../server/cleanup'
 import {
   S3Client,
   GetObjectCommand,
+  HeadObjectCommand,
   DeleteObjectCommand,
   ListObjectsV2Command,
   NoSuchKey
@@ -13,7 +14,7 @@ import {
 import { Upload } from '@aws-sdk/lib-storage'
 import { getCacheKey } from '@/lib/constants'
 import { core } from '@/lib/core'
-import { timingProvider } from '@/lib/utils'
+import { mapLimit, timingProvider } from '@/lib/utils'
 import { getTracker } from '@/lib/tracker'
 
 // Helper function to get input value, prioritizing environment variables for local development
@@ -35,6 +36,17 @@ const getInput = (name: string, envNames?: string[]): string | undefined => {
 }
 
 const artifactTagMetadata = 'artifact-tag'
+
+// Turbo asks about up to 100 hashes per batch and sends the batches one after
+// another; 32 checks in flight keep a batch to a few round trips.
+const existsConcurrency = 32
+
+/** HeadObject reports a missing key as a bare 404 (`NotFound`), not NoSuchKey. */
+const isNotFound = (error: unknown): boolean => {
+  if (error instanceof NoSuchKey) return true
+  const e = error as { name?: string; $metadata?: { httpStatusCode?: number } }
+  return e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404
+}
 
 export const getS3Provider = (
   tracker: ReturnType<typeof getTracker>
@@ -157,6 +169,32 @@ export const getS3Provider = (
     }
   }
 
+  const exists = async (
+    _ctx: RequestContext,
+    hash: string
+  ): Promise<boolean> => {
+    try {
+      await s3Client.send(
+        new HeadObjectCommand({ Bucket: s3Bucket, Key: getS3Key(hash) })
+      )
+      return true
+    } catch (error) {
+      if (isNotFound(error)) return false
+      throw error
+    }
+  }
+  const timedExists = timingProvider('exists', tracker, exists)
+
+  const existsMany = async (
+    ctx: RequestContext,
+    hashes: readonly string[]
+  ): Promise<Map<string, boolean>> => {
+    const found = await mapLimit(hashes, existsConcurrency, hash =>
+      timedExists(ctx, hash)
+    )
+    return new Map(hashes.map((hash, i) => [hash, found[i]]))
+  }
+
   const deleteObj = async (key: string): Promise<void> => {
     try {
       const deleteCommand = new DeleteObjectCommand({
@@ -225,6 +263,8 @@ export const getS3Provider = (
     name: 's3',
     save: timingProvider('save', tracker, save),
     get: timingProvider('get', tracker, get),
+    exists: timedExists,
+    existsMany,
     delete: timingProvider('delete', tracker, deleteObj),
     list: timingProvider('list', tracker, list)
   }

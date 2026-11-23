@@ -19,3 +19,33 @@ export const timingProvider = <
     return result
   }
 }
+
+/**
+ * Maps `items` through `fn` with at most `limit` calls in flight, keeping the
+ * input order. The first rejection rejects the whole map and stops starting
+ * new calls.
+ */
+export const mapLimit = async <T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> => {
+  const results = new Array<R>(items.length)
+  let next = 0
+  let failed = false
+  const worker = async (): Promise<void> => {
+    while (!failed && next < items.length) {
+      const i = next++
+      try {
+        results[i] = await fn(items[i])
+      } catch (error) {
+        failed = true
+        throw error
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker)
+  )
+  return results
+}
