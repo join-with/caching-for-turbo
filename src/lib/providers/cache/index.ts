@@ -11,6 +11,7 @@ import { timingProvider } from '@/lib/utils'
 import { getCacheKey, getFsCachePath, getTempCachePath } from '../../constants'
 import { env } from '../../env'
 import type { TProvider } from '../../providers'
+import { ExistsNotSupportedError } from '../errors'
 import type { RequestContext } from '../../server'
 import type { TListFile } from '../../server/cleanup'
 import { getCacheClient } from './utils'
@@ -68,6 +69,25 @@ export async function getCache(
   return [size, readableStream, artifactTag]
 }
 
+// The filesystem fallback can answer from the file; the GitHub cache API has
+// no existence check short of a restore, so it says so instead.
+export async function existsCache(
+  _ctx: RequestContext,
+  hash: string
+): Promise<boolean> {
+  if (!env.valid) return existsSync(getFsCachePath(hash))
+  throw new ExistsNotSupportedError('github')
+}
+
+export async function existsManyCache(
+  ctx: RequestContext,
+  hashes: readonly string[]
+): Promise<Map<string, boolean>> {
+  const found = new Map<string, boolean>()
+  for (const hash of hashes) found.set(hash, await existsCache(ctx, hash))
+  return found
+}
+
 export async function deleteCache(): Promise<void> {
   throw new Error(`Cannot delete github cache automatically.`)
 }
@@ -83,6 +103,8 @@ export const getGithubProvider = (
     name: 'github',
     save: timingProvider('save', tracker, saveCache),
     get: timingProvider('get', tracker, getCache),
+    exists: timingProvider('exists', tracker, existsCache),
+    existsMany: existsManyCache,
     delete: timingProvider('delete', tracker, deleteCache),
     list: timingProvider('list', tracker, listCache)
   }
