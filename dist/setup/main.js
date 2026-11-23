@@ -190683,6 +190683,106 @@ var getGithubProvider = (tracker) => {
 // src/lib/providers/s3/index.ts
 var import_client_s3 = __toESM(require_dist_cjs16(), 1);
 var import_lib_storage = __toESM(require_dist_cjs17(), 1);
+
+// src/lib/providers/s3/index-cache.ts
+var shardPrefixes = () => Array.from({ length: 256 }, (_, i5) => i5.toString(16).padStart(2, "0"));
+var shardable = /^[0-9a-f]{2}/;
+var KeyIndex = class {
+  listPage;
+  keyPrefix;
+  concurrency;
+  readyTimeoutMs;
+  log;
+  /** The hashes of the current build, filled while it lists. */
+  keys;
+  build;
+  ready;
+  deadline = 0;
+  stats;
+  constructor(options) {
+    this.listPage = options.listPage;
+    this.keyPrefix = options.keyPrefix;
+    this.concurrency = options.concurrency ?? 32;
+    this.readyTimeoutMs = options.readyTimeoutMs ?? 15e3;
+    this.log = options.log ?? (() => {
+    });
+  }
+  /** Whether the index can answer for this hash. */
+  covers(hash) {
+    return shardable.test(hash);
+  }
+  /**
+   * The index once built, or undefined when the build failed or is not done
+   * by its deadline. Starts a build when none is running.
+   */
+  async whenReady() {
+    if (this.ready) return this.ready;
+    if (!this.build) this.start();
+    const build2 = this.build;
+    const remaining = this.deadline - Date.now();
+    if (remaining <= 0) return void 0;
+    let timer;
+    const timeout = new Promise((resolve3) => {
+      timer = setTimeout(() => resolve3(void 0), remaining);
+    });
+    try {
+      return await Promise.race([build2.catch(() => void 0), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  /** Records a saved hash; a no-op before the first build starts. */
+  add(hash) {
+    this.keys?.add(hash);
+  }
+  start() {
+    const keys = /* @__PURE__ */ new Set();
+    this.keys = keys;
+    this.deadline = Date.now() + this.readyTimeoutMs;
+    const build2 = this.list(keys).then(
+      (stats) => {
+        this.stats = stats;
+        this.ready = keys;
+        this.log(
+          `Key index: ${stats.keys} keys from ${stats.pages} pages in ${stats.ms} ms`
+        );
+        return keys;
+      },
+      (error4) => {
+        if (this.build === build2) {
+          this.build = void 0;
+          this.keys = void 0;
+        }
+        this.log(`Key index build failed, checking per hash: ${error4}`);
+        throw error4;
+      }
+    );
+    build2.catch(() => {
+    });
+    this.build = build2;
+  }
+  async list(keys) {
+    const started = Date.now();
+    let pages = 0;
+    await mapLimit(shardPrefixes(), this.concurrency, async (shard) => {
+      let token;
+      do {
+        const page = await this.listPage(`${this.keyPrefix}${shard}`, token);
+        pages++;
+        for (const key of page.keys) {
+          if (!key.startsWith(this.keyPrefix)) continue;
+          const hash = key.slice(this.keyPrefix.length);
+          if (hash.includes("#")) continue;
+          keys.add(hash);
+        }
+        token = page.next;
+      } while (token);
+    });
+    return { keys: keys.size, pages, ms: Date.now() - started };
+  }
+};
+
+// src/lib/providers/s3/index.ts
 var getInput3 = (name, envNames) => {
   if (process.env.GITHUB_ACTIONS === "true") {
     const coreInput = core.getInput(name);
@@ -190698,6 +190798,7 @@ var getInput3 = (name, envNames) => {
 };
 var artifactTagMetadata = "artifact-tag";
 var existsConcurrency = 32;
+var keyIndexes = /* @__PURE__ */ new Map();
 var isNotFound = (error4) => {
   if (error4 instanceof import_client_s3.NoSuchKey) return true;
   const e5 = error4;
@@ -190749,6 +190850,36 @@ var getS3Provider = (tracker) => {
     }
     return key;
   };
+  const keyPrefix = `${s3Prefix}${cachePrefix}`;
+  const indexId = `${s3Endpoint}|${s3Bucket}|${keyPrefix}`;
+  let keyIndex = keyIndexes.get(indexId);
+  if (!keyIndex) {
+    const listPage = timingProvider(
+      "list",
+      tracker,
+      async (prefix2, continuationToken) => {
+        const response = await s3Client.send(
+          new import_client_s3.ListObjectsV2Command({
+            Bucket: s3Bucket,
+            Prefix: prefix2,
+            MaxKeys: 1e3,
+            ContinuationToken: continuationToken
+          })
+        );
+        return {
+          keys: (response.Contents ?? []).flatMap((o3) => o3.Key ? [o3.Key] : []),
+          next: response.NextContinuationToken
+        };
+      }
+    );
+    keyIndex = new KeyIndex({
+      listPage,
+      keyPrefix,
+      log: (message) => console.log(message)
+    });
+    keyIndexes.set(indexId, keyIndex);
+  }
+  const index = keyIndex;
   const save = async (ctx, hash, tag, stream2) => {
     const objectKey = getS3Key(hash);
     try {
@@ -190763,6 +190894,7 @@ var getS3Provider = (tracker) => {
         }
       });
       await upload.done();
+      index.add(hash);
       ctx.log.info(`Saved artifact to S3: ${objectKey}`);
     } catch (error4) {
       ctx.log.info(`Error saving artifact to S3: ${error4}`);
@@ -190810,12 +190942,20 @@ var getS3Provider = (tracker) => {
   };
   const timedExists = timingProvider("exists", tracker, exists2);
   const existsMany = async (ctx, hashes) => {
+    const ready = await index.whenReady();
+    const answers = /* @__PURE__ */ new Map();
+    const unanswered = [];
+    for (const hash of hashes) {
+      if (ready && index.covers(hash)) answers.set(hash, ready.has(hash));
+      else unanswered.push(hash);
+    }
     const found = await mapLimit(
-      hashes,
+      unanswered,
       existsConcurrency,
       (hash) => timedExists(ctx, hash)
     );
-    return new Map(hashes.map((hash, i5) => [hash, found[i5]]));
+    unanswered.forEach((hash, i5) => answers.set(hash, found[i5]));
+    return answers;
   };
   const deleteObj = async (key) => {
     try {
