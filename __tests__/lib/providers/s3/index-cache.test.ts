@@ -90,29 +90,26 @@ describe('KeyIndex', () => {
     expect(listPage).toHaveBeenCalledTimes(256)
   })
 
-  it('answers undefined while a slow listing passes its deadline, then the index', async () => {
+  it('answers undefined at once while the listing is pending, then the index', async () => {
     let release = (): void => {}
     const gate = new Promise<void>(resolve => {
       release = resolve
     })
-    const index = new KeyIndex({
-      keyPrefix,
-      readyTimeoutMs: 20,
-      listPage: async prefix => {
-        await gate
-        return { keys: prefix.endsWith('aa') ? [`${keyPrefix}aa01`] : [] }
-      }
+    const listPage = vi.fn<ListPage>(async prefix => {
+      await gate
+      return { keys: prefix.endsWith('aa') ? [`${keyPrefix}aa01`] : [] }
     })
+    const index = new KeyIndex({ keyPrefix, listPage })
 
-    expect(await index.whenReady()).toBeUndefined()
-    // Past the deadline, callers don't wait at all
-    const started = Date.now()
-    expect(await index.whenReady()).toBeUndefined()
-    expect(Date.now() - started).toBeLessThan(15)
+    // current() starts the build and returns without waiting for it
+    expect(index.current()).toBeUndefined()
+    expect(listPage).toHaveBeenCalled()
+    expect(index.current()).toBeUndefined()
 
     release()
-    await vi.waitFor(() => expect(index.stats).toBeDefined())
-    expect(await index.whenReady()).toEqual(new Set(['aa01']))
+    await index.settled()
+    expect(index.current()).toEqual(new Set(['aa01']))
+    expect(listPage).toHaveBeenCalledTimes(256)
   })
 
   it('resets after a failed build, so the next caller retries', async () => {
@@ -129,8 +126,12 @@ describe('KeyIndex', () => {
 
     expect(await index.whenReady()).toBeUndefined()
     expect(log).toHaveBeenCalledWith(expect.stringContaining('R2 down'))
+    // Settling doesn't start a new build; the next caller does
+    await index.settled()
     fail = false
-    expect(await index.whenReady()).toEqual(new Set(['aa01']))
+    expect(index.current()).toBeUndefined()
+    await index.settled()
+    expect(index.current()).toEqual(new Set(['aa01']))
   })
 
   it('adds saved hashes during and after a build, not before one', async () => {

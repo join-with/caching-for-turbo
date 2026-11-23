@@ -10,7 +10,9 @@ const { send, bucket, state } = vi.hoisted(() => ({
     headInFlight: 0,
     maxHeadInFlight: 0,
     listFails: false,
-    pageSize: 2
+    pageSize: 2,
+    // When set, every ListObjectsV2 waits for it
+    listGate: undefined as Promise<void> | undefined
   }
 }))
 
@@ -40,7 +42,10 @@ import {
   NoSuchKey,
   S3ServiceException
 } from '@aws-sdk/client-s3'
-import { resetS3KeyIndexes } from '../../../src/lib/providers/s3'
+import {
+  resetS3KeyIndexes,
+  settleS3KeyIndexes
+} from '../../../src/lib/providers/s3'
 import { buildServer } from '../../../src/lib/server'
 
 type Command = {
@@ -70,7 +75,10 @@ const fakeS3 = async (command: Command): Promise<unknown> => {
   try {
     await new Promise(resolve => setTimeout(resolve, 1))
     const key = command.input.Key as string
-    if (command instanceof ListObjectsV2Command) return listPage(command)
+    if (command instanceof ListObjectsV2Command) {
+      await state.listGate
+      return listPage(command)
+    }
     if (isHead) {
       if (bucket.has(key)) return {}
       throw new NotFound({ message: 'not found', $metadata: {} })
@@ -112,6 +120,7 @@ describe('artifact existence routes', () => {
     state.maxHeadInFlight = 0
     state.listFails = false
     state.pageSize = 2
+    state.listGate = undefined
     process.env.PROVIDER = 's3'
     process.env.S3_ACCESS_KEY_ID = 'id'
     process.env.S3_SECRET_ACCESS_KEY = 'secret'
@@ -201,6 +210,40 @@ describe('artifact existence routes', () => {
     const post = (hashes: string[]) =>
       app.inject({ method: 'POST', url: '/v8/artifacts', payload: { hashes } })
 
+    /** Starts the index with a first POST, waits for it, forgets the calls. */
+    const buildIndex = async () => {
+      await post(['00'])
+      await settleS3KeyIndexes()
+      send.mockClear()
+    }
+
+    it('answers the first POST per hash without waiting for a slow listing', async () => {
+      bucket.add('prefix/turbogha_aaaa')
+      let release = (): void => {}
+      state.listGate = new Promise<void>(resolve => {
+        release = resolve
+      })
+
+      const first = await post(['aaaa', 'bbbb'])
+
+      // Answered while every listing is still held at the gate
+      const expected = { aaaa: { taskDurationMs: 0 }, bbbb: null }
+      expect(first.statusCode).toBe(200)
+      expect(first.json()).toEqual(expected)
+      expect(commandsSent(HeadObjectCommand)).toBe(2)
+      expect(commandsSent(ListObjectsV2Command)).toBe(32)
+
+      release()
+      await settleS3KeyIndexes()
+      send.mockClear()
+      const later = await post(['aaaa', 'bbbb'])
+
+      // Same answers, now from the index alone
+      expect(later.json()).toEqual(expected)
+      expect(commandsSent(HeadObjectCommand)).toBe(0)
+      expect(commandsSent(ListObjectsV2Command)).toBe(0)
+    })
+
     it('answers every hash from one sharded listing, with no HeadObject', async () => {
       // 5 keys under shard 00 (3 pages of 2), one each under 7f and ff,
       // an old `hash#tag` key and a key outside the cache prefix
@@ -208,19 +251,8 @@ describe('artifact existence routes', () => {
         bucket.add(`prefix/turbogha_${h}`)
       bucket.add('prefix/turbogha_abcd#tag')
       bucket.add('prefix/other_abcd')
-
-      const res = await post([
-        '0001',
-        '0005',
-        '7f00',
-        'ff00',
-        '0006',
-        'abcd',
-        'ab00'
-      ])
-
-      expect(res.statusCode).toBe(200)
-      expect(res.json()).toEqual({
+      const hashes = ['0001', '0005', '7f00', 'ff00', '0006', 'abcd', 'ab00']
+      const expected = {
         '0001': { taskDurationMs: 0 },
         '0005': { taskDurationMs: 0 },
         '7f00': { taskDurationMs: 0 },
@@ -228,12 +260,21 @@ describe('artifact existence routes', () => {
         '0006': null,
         abcd: null,
         ab00: null
-      })
-      expect(commandsSent(HeadObjectCommand)).toBe(0)
+      }
+
+      const perHash = await post(hashes)
+      await settleS3KeyIndexes()
       const prefixes = send.mock.calls
         .map(([command]) => command)
         .filter(command => command instanceof ListObjectsV2Command)
         .map(command => command.input.Prefix)
+      send.mockClear()
+      const fromIndex = await post(hashes)
+
+      expect(perHash.json()).toEqual(expected)
+      expect(fromIndex.statusCode).toBe(200)
+      expect(fromIndex.json()).toEqual(expected)
+      expect(commandsSent(HeadObjectCommand)).toBe(0)
       // 256 shards, plus two continuation pages for shard 00
       expect(prefixes).toHaveLength(258)
       expect(new Set(prefixes).size).toBe(256)
@@ -245,15 +286,17 @@ describe('artifact existence routes', () => {
       bucket.add('prefix/turbogha_aaaa')
 
       await Promise.all([post(['aaaa']), post(['bbbb'])])
+      await settleS3KeyIndexes()
       const res = await post(['aaaa', 'cccc'])
 
       expect(res.json()).toEqual({ aaaa: { taskDurationMs: 0 }, cccc: null })
       expect(commandsSent(ListObjectsV2Command)).toBe(256)
-      expect(commandsSent(HeadObjectCommand)).toBe(0)
+      // Only the two first POSTs checked per hash
+      expect(commandsSent(HeadObjectCommand)).toBe(2)
     })
 
     it('adds a saved hash to the index', async () => {
-      await post(['aaaa'])
+      await buildIndex()
 
       const put = await app.inject({
         method: 'PUT',
@@ -267,11 +310,12 @@ describe('artifact existence routes', () => {
 
       expect(put.statusCode).toBe(200)
       expect(res.json()).toEqual({ aaaa: { taskDurationMs: 0 } })
-      expect(commandsSent(ListObjectsV2Command)).toBe(256)
+      expect(commandsSent(ListObjectsV2Command)).toBe(0)
       expect(commandsSent(HeadObjectCommand)).toBe(0)
     })
 
     it('checks R2 for a hash the shard listing does not cover', async () => {
+      await buildIndex()
       bucket.add('prefix/turbogha_ping-test-file')
 
       const res = await post(['ping-test-file', 'zz'])
@@ -284,6 +328,7 @@ describe('artifact existence routes', () => {
     })
 
     it('answers 501 when R2 fails a check the index left to it', async () => {
+      await buildIndex()
       send.mockImplementation(async (command: Command) => {
         if (command instanceof HeadObjectCommand) throw r2Error()
         return fakeS3(command)
@@ -294,19 +339,24 @@ describe('artifact existence routes', () => {
       expect(res.statusCode).toBe(501)
     })
 
-    it('falls back to per-hash checks when the listing fails, and retries it', async () => {
+    it('answers per hash after a failed listing and retries it on a later POST', async () => {
       bucket.add('prefix/turbogha_aaaa')
       state.listFails = true
+      const expected = { aaaa: { taskDurationMs: 0 }, bbbb: null }
 
       const first = await post(['aaaa', 'bbbb'])
+      await settleS3KeyIndexes()
       state.listFails = false
+      // Starts a new build, answered per hash while it runs
       const second = await post(['aaaa', 'bbbb'])
+      await settleS3KeyIndexes()
+      const third = await post(['aaaa', 'bbbb'])
 
-      const expected = { aaaa: { taskDurationMs: 0 }, bbbb: null }
       expect(first.json()).toEqual(expected)
       expect(second.json()).toEqual(expected)
-      // The first POST checked R2 per hash; the second built the index
-      expect(commandsSent(HeadObjectCommand)).toBe(2)
+      expect(third.json()).toEqual(expected)
+      // The first two POSTs checked R2 per hash; the third used the index
+      expect(commandsSent(HeadObjectCommand)).toBe(4)
       expect(commandsSent(ListObjectsV2Command)).toBeGreaterThan(256)
     })
   })

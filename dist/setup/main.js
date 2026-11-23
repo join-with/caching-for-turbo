@@ -190691,19 +190691,16 @@ var KeyIndex = class {
   listPage;
   keyPrefix;
   concurrency;
-  readyTimeoutMs;
   log;
   /** The hashes of the current build, filled while it lists. */
   keys;
   build;
   ready;
-  deadline = 0;
   stats;
   constructor(options) {
     this.listPage = options.listPage;
     this.keyPrefix = options.keyPrefix;
     this.concurrency = options.concurrency ?? 32;
-    this.readyTimeoutMs = options.readyTimeoutMs ?? 15e3;
     this.log = options.log ?? (() => {
     });
   }
@@ -190712,24 +190709,27 @@ var KeyIndex = class {
     return shardable.test(hash);
   }
   /**
-   * The index once built, or undefined when the build failed or is not done
-   * by its deadline. Starts a build when none is running.
+   * The index once built, otherwise undefined. Starts a build when none is
+   * running and never waits for it.
    */
-  async whenReady() {
+  current() {
     if (this.ready) return this.ready;
     if (!this.build) this.start();
-    const build2 = this.build;
-    const remaining = this.deadline - Date.now();
-    if (remaining <= 0) return void 0;
-    let timer;
-    const timeout = new Promise((resolve3) => {
-      timer = setTimeout(() => resolve3(void 0), remaining);
+    return void 0;
+  }
+  /**
+   * Waits for the running build, starting one when none is running: the
+   * index, or undefined when the build fails.
+   */
+  async whenReady() {
+    this.current();
+    await this.settled();
+    return this.ready;
+  }
+  /** Waits for the running build, if any, to finish or fail. */
+  async settled() {
+    await this.build?.catch(() => {
     });
-    try {
-      return await Promise.race([build2.catch(() => void 0), timeout]);
-    } finally {
-      clearTimeout(timer);
-    }
   }
   /** Records a saved hash; a no-op before the first build starts. */
   add(hash) {
@@ -190738,7 +190738,6 @@ var KeyIndex = class {
   start() {
     const keys = /* @__PURE__ */ new Set();
     this.keys = keys;
-    this.deadline = Date.now() + this.readyTimeoutMs;
     const build2 = this.list(keys).then(
       (stats) => {
         this.stats = stats;
@@ -190942,7 +190941,7 @@ var getS3Provider = (tracker) => {
   };
   const timedExists = timingProvider("exists", tracker, exists2);
   const existsMany = async (ctx, hashes) => {
-    const ready = await index.whenReady();
+    const ready = index.current();
     const answers = /* @__PURE__ */ new Map();
     const unanswered = [];
     for (const hash of hashes) {
