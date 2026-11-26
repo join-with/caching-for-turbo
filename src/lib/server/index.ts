@@ -63,6 +63,8 @@ export function buildServer(
       if (!result) {
         throw new Error('Failed to retrieve test file from cache')
       }
+      // The body is never read; destroying it frees its connection.
+      if (result[1] instanceof Readable) result[1].destroy()
       request.log.info('Cache retrieval test successful')
       tests.push('retrieve')
 

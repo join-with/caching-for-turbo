@@ -1,5 +1,6 @@
 import { TProvider } from '@/lib/providers'
 
+import { createHash } from 'crypto'
 import { Readable } from 'stream'
 import { RequestContext } from '../../server'
 import { TListFile } from '../../server/cleanup'
@@ -49,6 +50,53 @@ const keyIndexes = new Map<string, KeyIndex>()
 /** Drops every key index; for tests. */
 export const resetS3KeyIndexes = (): void => keyIndexes.clear()
 
+// One S3 client per endpoint, region and credentials, kept for the life of the
+// process: getS3Provider runs on every request, and each S3Client owns its own
+// keep-alive connection pool. A client per request left its pooled sockets open
+// to the endpoint, and a long-running server built up thousands of them.
+const s3Clients = new Map<string, S3Client>()
+
+/** Destroys and drops every cached S3 client; for tests. */
+export const resetS3Clients = (): void => {
+  for (const client of s3Clients.values()) client.destroy()
+  s3Clients.clear()
+}
+
+const getS3Client = (config: {
+  region: string
+  endpoint: string
+  accessKeyId: string
+  secretAccessKey: string
+  sessionToken?: string
+}): S3Client => {
+  // Hashed so no secret sits in a map key.
+  const id = createHash('sha256')
+    .update(
+      JSON.stringify([
+        config.endpoint,
+        config.region,
+        config.accessKeyId,
+        config.secretAccessKey,
+        config.sessionToken ?? ''
+      ])
+    )
+    .digest('hex')
+  let client = s3Clients.get(id)
+  if (!client) {
+    client = new S3Client({
+      region: config.region,
+      endpoint: config.endpoint,
+      credentials: {
+        accessKeyId: config.accessKeyId,
+        secretAccessKey: config.secretAccessKey,
+        sessionToken: config.sessionToken
+      }
+    })
+    s3Clients.set(id, client)
+  }
+  return client
+}
+
 /** Waits for every running key index build to finish or fail; for tests. */
 export const settleS3KeyIndexes = async (): Promise<void> => {
   await Promise.all([...keyIndexes.values()].map(index => index.settled()))
@@ -96,14 +144,12 @@ export const getS3Provider = (
     )
   }
 
-  const s3Client = new S3Client({
+  const s3Client = getS3Client({
     region: s3Region,
     endpoint: s3Endpoint,
-    credentials: {
-      accessKeyId: s3AccessKeyId,
-      secretAccessKey: s3SecretAccessKey,
-      sessionToken: s3SessionToken
-    }
+    accessKeyId: s3AccessKeyId,
+    secretAccessKey: s3SecretAccessKey,
+    sessionToken: s3SessionToken
   })
 
   // The artifact tag lives in object metadata, not the key, so a lookup can read
