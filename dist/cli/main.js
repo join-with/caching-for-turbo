@@ -97006,7 +97006,7 @@ var require_dist_cjs11 = __commonJS({
     var { setCredentialFeature: setCredentialFeature2 } = (init_client3(), __toCommonJS(client_exports2));
     var { CredentialsProviderError: CredentialsProviderError2, parseKnownFiles: parseKnownFiles2, getProfileName: getProfileName2 } = (init_config2(), __toCommonJS(config_exports));
     var { HttpRequest: HttpRequest2 } = (init_protocols(), __toCommonJS(protocols_exports));
-    var { createHash: createHash7, createPrivateKey, createPublicKey, sign: sign3 } = __require("node:crypto");
+    var { createHash: createHash8, createPrivateKey, createPublicKey, sign: sign3 } = __require("node:crypto");
     var { promises: promises5 } = __require("node:fs");
     var { homedir: homedir3 } = __require("node:os");
     var { dirname: dirname6, join: join12 } = __require("node:path");
@@ -97175,7 +97175,7 @@ var require_dist_cjs11 = __commonJS({
       getTokenFilePath() {
         const directory = process.env.AWS_LOGIN_CACHE_DIRECTORY ?? join12(homedir3(), ".aws", "login", "cache");
         const loginSessionBytes = Buffer.from(this.loginSession, "utf8");
-        const loginSessionSha256 = createHash7("sha256").update(loginSessionBytes).digest("hex");
+        const loginSessionSha256 = createHash8("sha256").update(loginSessionBytes).digest("hex");
         return join12(directory, `${loginSessionSha256}.json`);
       }
       derToRawSignature(derSignature) {
@@ -191078,6 +191078,7 @@ var getGithubProvider = (tracker) => {
 // src/lib/providers/s3/index.ts
 var import_client_s3 = __toESM(require_dist_cjs16(), 1);
 var import_lib_storage = __toESM(require_dist_cjs17(), 1);
+import { createHash as createHash7 } from "crypto";
 
 // src/lib/providers/s3/index-cache.ts
 var shardPrefixes = () => Array.from({ length: 256 }, (_, i5) => i5.toString(16).padStart(2, "0"));
@@ -191193,6 +191194,32 @@ var getInput3 = (name, envNames) => {
 var artifactTagMetadata = "artifact-tag";
 var existsConcurrency = 32;
 var keyIndexes = /* @__PURE__ */ new Map();
+var s3Clients = /* @__PURE__ */ new Map();
+var getS3Client = (config2) => {
+  const id = createHash7("sha256").update(
+    JSON.stringify([
+      config2.endpoint,
+      config2.region,
+      config2.accessKeyId,
+      config2.secretAccessKey,
+      config2.sessionToken ?? ""
+    ])
+  ).digest("hex");
+  let client = s3Clients.get(id);
+  if (!client) {
+    client = new import_client_s3.S3Client({
+      region: config2.region,
+      endpoint: config2.endpoint,
+      credentials: {
+        accessKeyId: config2.accessKeyId,
+        secretAccessKey: config2.secretAccessKey,
+        sessionToken: config2.sessionToken
+      }
+    });
+    s3Clients.set(id, client);
+  }
+  return client;
+};
 var isNotFound = (error4) => {
   if (error4 instanceof import_client_s3.NoSuchKey) return true;
   const e5 = error4;
@@ -191228,14 +191255,12 @@ var getS3Provider = (tracker) => {
       "S3 provider requires s3-access-key-id, s3-secret-access-key, s3-bucket, and s3-region. Set these as environment variables or GitHub Actions inputs."
     );
   }
-  const s3Client = new import_client_s3.S3Client({
+  const s3Client = getS3Client({
     region: s3Region,
     endpoint: s3Endpoint,
-    credentials: {
-      accessKeyId: s3AccessKeyId,
-      secretAccessKey: s3SecretAccessKey,
-      sessionToken: s3SessionToken
-    }
+    accessKeyId: s3AccessKeyId,
+    secretAccessKey: s3SecretAccessKey,
+    sessionToken: s3SessionToken
   });
   const getS3Key = (hash) => {
     const key = getCacheKey(hash);
@@ -191707,6 +191732,7 @@ function buildServer(tracker = getTracker()) {
       if (!result) {
         throw new Error("Failed to retrieve test file from cache");
       }
+      if (result[1] instanceof Readable12) result[1].destroy();
       request.log.info("Cache retrieval test successful");
       tests.push("retrieve");
       try {

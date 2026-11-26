@@ -9,7 +9,7 @@ const { send, uploads } = vi.hoisted(() => ({
 vi.mock('@aws-sdk/client-s3', async importOriginal => ({
   ...(await importOriginal<typeof import('@aws-sdk/client-s3')>()),
   S3Client: vi.fn(function () {
-    return { send }
+    return { send, destroy: () => {} }
   })
 }))
 
